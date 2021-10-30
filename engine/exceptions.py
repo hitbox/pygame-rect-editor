@@ -1,0 +1,2 @@
+class RectEditError(Exception):
+    pass
