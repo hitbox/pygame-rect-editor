@@ -4,12 +4,13 @@ import os
 
 from abc import ABC
 from abc import abstractmethod
+from collections import OrderedDict
 from collections import defaultdict
 from contextlib import redirect_stdout
 from dataclasses import dataclass
 from itertools import tee
 
-with redirect_stdout(open(os.devnull,'w')):
+with redirect_stdout(open(os.devnull, 'w')):
     import pygame
 
 # divide minimum side of rect by...
@@ -17,6 +18,20 @@ _button_width_denominator = 5
 # ...to get an appealing, *thick* line width for something inside the rect.
 
 _listeners = defaultdict(list)
+
+COMMANDSWITCH = pygame.USEREVENT
+COMMANDBEGIN = pygame.USEREVENT + 1
+
+RECTPOINTS = OrderedDict([
+    ('topleft', 'bottomright'),
+    ('midtop', 'midbottom'),
+    ('topright', 'bottomleft'),
+    ('midright', 'midleft'),
+    ('bottomright', 'topleft'),
+    ('midbottom', 'midtop'),
+    ('bottomleft', 'bottomright'),
+    ('midleft', 'midright'),
+])
 
 class RectEditError(Exception):
     pass
@@ -37,42 +52,44 @@ class Sprite:
     props: dict
 
 
-@dataclass
+class HandleRect:
+
+    def __init__(self, parent, handle):
+        self.parent = parent
+        self.handle = handle
+
+
 class EditRect:
-    rect: pygame.Rect
 
-    def _handle_rect(self):
-        size = min(self.rect.size) // 4
-        rect = pygame.Rect((0,0), (size,)*2)
-        return rect
+    minimum_corner_handle_size = 10
 
-    def topleft_resize_handle(self):
-        rect = self._handle_rect()
-        rect.topleft = self.rect.topleft
-        return rect
+    def _popopt(self, options, key):
+        "pop key from options, defaulting to attribute of same name"
+        return options.pop(key, getattr(self, key))
 
-    def topright_resize_handle(self):
-        rect = self._handle_rect()
-        rect.topright = self.rect.topright
-        return rect
+    def __init__(self, rect, **options):
+        self.rect = rect
+        self.minimum_corner_handle_size = self._popopt(options, 'minimum_corner_handle_size')
+        if options:
+            raise RectEditError(f'Unknown options {", ".join(options)}.')
+        self.reset_handles()
 
-    def bottomright_resize_handle(self):
-        rect = self._handle_rect()
-        rect.bottomright = self.rect.bottomright
-        return rect
+    def reset_handles(self):
+        self.handles = []
+        for attrname, rect in iter_rect_handles(self.rect):
+            setattr(self, f'handle_{attrname}', rect)
+            self.handles.append(rect)
 
-    def bottomleft_resize_handle(self):
-        rect = self._handle_rect()
-        rect.bottomleft = self.rect.bottomleft
-        return rect
 
-    def resize_handles(self):
-        return [
-            self.topleft_resize_handle(),
-            self.topright_resize_handle(),
-            self.bottomright_resize_handle(),
-            self.bottomleft_resize_handle(),
-        ]
+class DrawRect:
+
+    def __init__(self, color, rect, width):
+        self.color = color
+        self.rect = rect
+        self.width = width
+
+    def __iter__(self):
+        return iter((self.color, self.rect, self.width))
 
 
 class Command(ABC):
@@ -86,6 +103,48 @@ class Command(ABC):
         pass
 
 
+class HighlightCommand(Command):
+
+    def __init__(self, parent):
+        self.editor = parent
+        self.current = None
+        self.handle2drawrect = {}
+
+    def begin(self, event):
+        listen(pygame.MOUSEMOTION, self.on_mousemotion)
+        listen(pygame.MOUSEBUTTONDOWN, self.on_mousebuttondown)
+
+    def on_mousemotion(self, event):
+        # XXX: SMELLY
+        # put DrawRect objects in drawing queue when mouse over
+        for editrect in self.editor.editrects:
+            for handle in editrect.handles:
+                handleid = id(handle)
+                if handle.collidepoint(event.pos):
+                    if handleid not in self.handle2drawrect:
+                        self.current = None
+                        drawrect = DrawRect((200,200,10), handle, 1)
+                        self.handle2drawrect[handleid] = drawrect
+                        self.editor.draw_rects.append(drawrect)
+                        self.current = handle
+                # once a collision has been found, can't we delete all other handles?
+                else:
+                    if handleid in self.handle2drawrect:
+                        drawrect = self.handle2drawrect[handleid]
+                        if drawrect in self.editor.draw_rects:
+                            self.editor.draw_rects.remove(drawrect)
+                            del self.handle2drawrect[handleid]
+
+    def on_mousebuttondown(self, event):
+        if self.current:
+            # begin dragging but how?
+            print(self.current)
+
+    def end(self):
+        unsubscribe(pygame.MOUSEMOTION, self.on_mousemotion)
+        unsubscribe(pygame.MOUSEBUTTONDOWN, self.on_mousebuttondown)
+
+
 class AddEditRectCommand(Command):
     """
     Add new EditRect to world.
@@ -97,7 +156,7 @@ class AddEditRectCommand(Command):
         editrect = parent.editrects
         rect = pygame.Rect(0,0,world.width // 4,world.height // 4)
         rect.center = world.center
-        editrect = EditRect(rect=rect)
+        editrect = EditRect(rect)
         parent.editrects.append(editrect)
 
     def end(self):
@@ -125,7 +184,25 @@ class MoveRectCommand(Command):
         unsubscribe(pygame.MOUSEMOTION, self.on_mousemotion)
 
 
-class RectEdit:
+class CommandManager:
+
+    def __init__(self):
+        self.current = None
+        listen(COMMANDSWITCH, self.on_commandswitch)
+
+    def switch(self, command):
+        event = pygame.event.Event(COMMANDSWITCH, command=command)
+        pygame.event.post(event)
+
+    def on_commandswitch(self, event):
+        if self.current:
+            self.current.end()
+        self.current = event.command
+        event = pygame.event.Event(COMMANDBEGIN)
+        self.current.begin(event)
+
+
+class RectEditor:
 
     def __init__(self):
         self.reset()
@@ -135,11 +212,11 @@ class RectEdit:
         self.editrects = []
         self.buttons = []
         self.draw_rects = []
-        self.highlight = None
         self.world = None
         self.screen = None
         #
-        self.current_command = MoveRectCommand()
+        self.command_manager = CommandManager()
+        self.command_manager.switch(HighlightCommand(parent=self))
         #
         listen(pygame.QUIT, self.on_quit)
         listen(pygame.KEYDOWN, self.on_keydown)
@@ -155,31 +232,13 @@ class RectEdit:
             pygame.event.post(pygame.event.Event(pygame.QUIT))
 
     def on_mousemotion(self, event):
-        for editrect in self.editrects:
-            for handle_rect in editrect.resize_handles():
-                if handle_rect.collidepoint(event.pos):
-                    self.draw_rects.append(handle_rect)
-        self.draw_rects = [
-            draw_rect for draw_rect in self.draw_rects
-            if draw_rect.collidepoint(event.pos)]
-        # XXX:
-        # 2021-10-30
-        # LEFT OFF HERE
-        # * slightly buggy resize handles working
-        # * when dragging they get added lots of time but disappear after
-        #   dropping (the drag).
+        pass
 
     def on_mousebuttondown(self, event):
-        for sprite in self.editrects:
-            if sprite.rect.collidepoint(event.pos):
-                event.target = sprite.rect
-                self.current_command.begin(event)
-                break
-        else:
-            for button in self.buttons:
-                if button.rect.collidepoint(event.pos):
-                    event.parent = self
-                    button.command.begin(event)
+        for button in self.buttons:
+            if button.rect.collidepoint(event.pos):
+                event.parent = self
+                button.command.begin(event)
 
     def on_mousebuttonup(self, event):
         pass
@@ -198,21 +257,16 @@ class RectEdit:
                 notify(event)
             # clear
             self.screen.blit(self.background, (0,0))
+            # draw rects and buttons
             for sprite in self.editrects + self.buttons:
                 if hasattr(sprite, 'image'):
                     self.screen.blit(sprite.image, sprite.rect)
                 else:
                     pygame.draw.rect(self.screen, (200,200,200), sprite.rect, 1)
-            for handle_rect in self.draw_rects:
-                pygame.draw.rect(self.screen, (200,200,10), handle_rect, 1)
+            # draw rects
+            for drawrect in self.draw_rects:
+                pygame.draw.rect(self.screen, *drawrect)
 
-            if self.highlight:
-                pygame.draw.rect(
-                    self.screen,
-                    (200,200,10),
-                    self.highlight.rect,
-                    min(self.highlight.rect.size)//8
-                )
             pygame.display.flip()
 
 
@@ -271,6 +325,26 @@ def pairwise(iterable):
     next(b, None)
     return zip(a, b)
 
+def setthisthat(toobj, toattr, fromobj, fromattr):
+    setattr(toobj, toattr, getattr(fromobj, fromattr))
+
+def iter_rect_points(rect):
+    for attrname in RECTPOINTS:
+        point = getattr(rect, attrname)
+        yield (attrname, point)
+
+def iter_rect_handles(rect, denom=4, minsize=10):
+    size = min(rect.size) // 4
+    if size < minsize:
+        size = minsize
+    for attrname, point in iter_rect_points(rect):
+        if 'mid' in attrname:
+            pass
+        else:
+            corner_rect = pygame.Rect((0,0),(size,)*2)
+            setthisthat(corner_rect, attrname, rect, attrname)
+            yield (attrname, corner_rect)
+
 def layout_horizontal(rects, padding=0):
     "in-place move rects horizontally"
     for r1, r2 in pairwise(rects):
@@ -285,37 +359,6 @@ def get_image(size, flags=None):
     if flags is None:
         flags = pygame.SRCALPHA
     return pygame.Surface(size, flags)
-
-def render_cross(size, color, linewidth=1, **kwargs):
-    "create image and render a cross"
-    imagekwargs = kwargs.get('imagekwargs', {})
-    padding = kwargs.get('padding')
-    if imagekwargs is None:
-        imagekwargs = {}
-    image = get_image(size, **imagekwargs)
-    draw_cross(image, color, linewidth, padding=padding)
-    return image
-
-def render_minusbutton(size, color):
-    """
-    Opinionated minus button renderer
-    """
-    image = get_image(size)
-    rect = image.get_rect()
-    width = min(rect.size) // _button_width_denominator
-    draw_hbar(image, color, width, padding=width)
-    draw_border(image, color, width=width//2)
-    return image
-
-def render_plusbutton(size, color):
-    """
-    Opinionated plus button renderer
-    """
-    rect = pygame.Rect((0,0), size)
-    width = min(rect.size) // _button_width_denominator
-    image = render_cross(rect.size, color, linewidth=width, padding=width)
-    draw_border(image, color, width=width//2)
-    return image
 
 def draw_border(image, color, width):
     """
@@ -362,18 +405,54 @@ def draw_cross(image, color, width=1, **kwargs):
     draw_hbar(image, color, width, **kwargs)
     draw_vbar(image, color, width, **kwargs)
 
+def render_cross(size, color, linewidth=1, **kwargs):
+    "create image and render a cross"
+    imagekwargs = kwargs.get('imagekwargs', {})
+    padding = kwargs.get('padding')
+    if imagekwargs is None:
+        imagekwargs = {}
+    image = get_image(size, **imagekwargs)
+    draw_cross(image, color, linewidth, padding=padding)
+    return image
+
+def render_minusbutton(size, color):
+    """
+    Opinionated minus button renderer
+    """
+    image = get_image(size)
+    rect = image.get_rect()
+    width = min(rect.size) // _button_width_denominator
+    draw_hbar(image, color, width, padding=width)
+    draw_border(image, color, width=width//2)
+    return image
+
+def render_plusbutton(size, color):
+    """
+    Opinionated plus button renderer
+    """
+    rect = pygame.Rect((0,0), size)
+    width = min(rect.size) // _button_width_denominator
+    image = render_cross(rect.size, color, linewidth=width, padding=width)
+    draw_border(image, color, width=width//2)
+    return image
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     args = parser.parse_args(argv)
     #
-    rectedit = RectEdit()
+    pygame.display.init()
+    # XXX: LEFT OFF HERE
+    # * unsure about the event system
+    # * things need to know about each other. the command needs to modify
+    #   RectEditor instance. OR another event? "add-rect" event?
+    rectedit = RectEditor()
     rectedit.init()
     # add buttons
     size = (50,) * 2
     buttons = []
+    # remove rect button
     image = render_minusbutton(size, (200,10,10))
     sprite = Sprite(image, image.get_rect(), props=dict(type='remove rect'))
-    # TODO
     sprite.command = AddEditRectCommand()
     buttons.append(sprite)
     #
